@@ -1,10 +1,10 @@
 name: Vectra
-version: '1.0.1'
+version: '2.1'
 main: me.vectra.Vectra
-api-version: '1.20'
+api-version: '26.3'
 commands:
   vectra:
-    description: Comando principal de Vectra
+    description: Comando de Vectra
     usage: /vectra alerts <jugador>
 permissions:
   vectra.alerts:
