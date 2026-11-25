@@ -1,5 +1,8 @@
 package me.vectra;
 
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.*;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
@@ -13,8 +16,8 @@ import org.bukkit.event.entity.*;
 import org.bukkit.event.inventory.*;
 import org.bukkit.event.player.*;
 import org.bukkit.inventory.ItemStack;
-import org.bukkit.inventory.InventoryView;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.util.BoundingBox;
 import org.bukkit.util.RayTraceResult;
@@ -24,20 +27,27 @@ import java.util.*;
 
 public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
 
-    private static Vectra instance;
+    private static class AirState {
+        double groundY, peakY;
+        long peakTime, last;
+        int vio;
+    }
+
     private final Set<UUID> staffAlerts = new HashSet<>();
     private final Map<UUID, Integer> vlMap = new HashMap<>();
-    private final Map<UUID, Long> vlTime = new HashMap<>();
+    private final Map<UUID, Long> lastFlagTime = new HashMap<>();
+    private final Map<UUID, Location> lastGround = new HashMap<>();
+    private final Map<UUID, AirState> airStates = new HashMap<>();
+    private final Map<UUID, Double> hoverY = new HashMap<>();
+    private final Map<UUID, Integer> hoverCount = new HashMap<>();
     private final Map<UUID, Integer> airTicks = new HashMap<>();
     private final Map<UUID, Integer> vehicleAirTicks = new HashMap<>();
     private final Map<UUID, Integer> waterTicks = new HashMap<>();
     private final Map<UUID, Integer> noSlowTicks = new HashMap<>();
-    private final Map<UUID, Integer> hoverTicks = new HashMap<>();
-    private final Map<UUID, Location> hoverPos = new HashMap<>();
-    private final Map<UUID, Location> lastGround = new HashMap<>();
     private final Map<UUID, Double> lastDeltaY = new HashMap<>();
     private final Map<UUID, Double> lastDeltaXZ = new HashMap<>();
     private final Map<UUID, Double> realFallDist = new HashMap<>();
+    private final Map<UUID, Long> lastFallDamage = new HashMap<>();
     private final Map<UUID, Vector> lastMoveDir = new HashMap<>();
     private final Map<UUID, Long> lastVelocity = new HashMap<>();
     private final Map<UUID, Long> lastTeleport = new HashMap<>();
@@ -46,7 +56,6 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
     private final Map<UUID, Long> lastBlockBreak = new HashMap<>();
     private final Map<UUID, Long> lastSwing = new HashMap<>();
     private final Map<UUID, Long> lastAttackTime = new HashMap<>();
-    private final Map<UUID, Long> lastMovePacket = new HashMap<>();
     private final Map<UUID, UUID> lastTarget = new HashMap<>();
     private final Map<UUID, Long> itemUseStart = new HashMap<>();
     private final Map<UUID, Long> lastInvClick = new HashMap<>();
@@ -57,74 +66,90 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
 
     @Override
     public void onEnable() {
-        instance = this;
         getServer().getPluginManager().registerEvents(this, this);
         if (getCommand("vectra") != null) getCommand("vectra").setExecutor(this);
-        Bukkit.getScheduler().runTaskTimer(this, this::hoverCheck, 20L, 5L);
-        getLogger().info("Vectra activado");
-    }
 
-    private Location back(UUID u, Location def) {
-        Location g = lastGround.get(u);
-        return g != null && g.getWorld() == def.getWorld() ? g : def;
+        Bukkit.getScheduler().runTaskTimer(this, () -> {
+            long now = System.currentTimeMillis();
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                UUID u = p.getUniqueId();
+                int vl = vlMap.getOrDefault(u, 0);
+                if (vl > 0 && now - lastFlagTime.getOrDefault(u, 0L) >= 15000) {
+                    vlMap.put(u, vl - 1);
+                    lastFlagTime.put(u, now);
+                }
+            }
+        }, 100L, 100L);
+
+        Bukkit.getScheduler().runTaskTimer(this, this::hoverCheck, 5L, 5L);
     }
 
     private void hoverCheck() {
         long now = System.currentTimeMillis();
         for (Player p : Bukkit.getOnlinePlayers()) {
             UUID u = p.getUniqueId();
-            if (isExemptMode(p) || p.isDead() || p.isGliding() || p.isInWater() || p.isSwimming() || p.isInLava()
-                    || p.isInsideVehicle() || p.isClimbing() || p.hasPotionEffect(PotionEffectType.LEVITATION)
-                    || p.hasPotionEffect(PotionEffectType.SLOW_FALLING)) {
-                hoverTicks.put(u, 0);
-                hoverPos.remove(u);
+            if (isExemptMode(p) || p.isInsideVehicle() || p.isGliding() || p.isSwimming() || p.isClimbing()
+                    || p.isInWater() || p.isInLava() || isBoosted(p, u, now)) {
+                hoverCount.remove(u);
+                hoverY.remove(u);
                 continue;
             }
-            Location l = p.getLocation();
-            Location prev = hoverPos.put(u, l);
-            boolean safe = now - lastVelocity.getOrDefault(u, 0L) > 1300 && now - lastTeleport.getOrDefault(u, 0L) > 1500;
-            if (prev != null && safe && prev.getWorld() == l.getWorld() && Math.abs(prev.getY() - l.getY()) < 0.0001 && isTrulyInAir(l) && !isNearMaterial(l, "SLIME", "HONEY", "COBWEB", "SCAFFOLDING")) {
-                int h = hoverTicks.getOrDefault(u, 0) + 1;
-                hoverTicks.put(u, h);
-                if (h >= 6) {
-                    flag(p, "Fly (Hover)", "Flotando " + h * 5 + " ticks");
-                    p.teleport(back(u, l));
-                    hoverTicks.put(u, 0);
+            Location loc = p.getLocation();
+            if (isTrulyInAir(loc)) {
+                double y = loc.getY();
+                Double prev = hoverY.put(u, y);
+                if (prev != null && Math.abs(y - prev) < 0.005) {
+                    int c = hoverCount.getOrDefault(u, 0) + 1;
+                    hoverCount.put(u, c);
+                    if (c >= 4) {
+                        flag(p, "Fly (Hover)", String.format("Y=%.2f", y));
+                        p.teleport(back(u, loc));
+                        hoverCount.put(u, 0);
+                    }
+                } else {
+                    hoverCount.put(u, 0);
                 }
             } else {
-                hoverTicks.put(u, 0);
+                hoverCount.remove(u);
+                hoverY.remove(u);
             }
         }
-    }
-
-    public static Vectra getInstance() { return instance; }
-    public boolean hasAlerts(UUID u) { return staffAlerts.contains(u); }
-    public boolean toggleAlerts(UUID u) {
-        if (staffAlerts.remove(u)) return false;
-        staffAlerts.add(u);
-        return true;
     }
 
     @EventHandler
     public void onQuit(PlayerQuitEvent e) {
         UUID u = e.getPlayer().getUniqueId();
-        staffAlerts.remove(u);
-        hoverTicks.remove(u); hoverPos.remove(u); lastGround.remove(u);
-        vlMap.remove(u); vlTime.remove(u); airTicks.remove(u); vehicleAirTicks.remove(u);
+        staffAlerts.remove(u); vlMap.remove(u); lastFlagTime.remove(u);
+        lastGround.remove(u); airStates.remove(u); hoverY.remove(u);
+        hoverCount.remove(u); airTicks.remove(u); vehicleAirTicks.remove(u);
         waterTicks.remove(u); noSlowTicks.remove(u); lastDeltaY.remove(u);
-        lastDeltaXZ.remove(u); realFallDist.remove(u); lastMoveDir.remove(u);
-        lastVelocity.remove(u); lastTeleport.remove(u); lastFirework.remove(u);
-        lastBlockPlace.remove(u); lastBlockBreak.remove(u); lastSwing.remove(u);
-        lastAttackTime.remove(u); lastTarget.remove(u); itemUseStart.remove(u);
-        lastInvClick.remove(u); fastClickStreak.remove(u); lastGlideToggle.remove(u);
-        lastMovePacket.remove(u); clicks.remove(u); movePackets.remove(u);
+        lastDeltaXZ.remove(u); realFallDist.remove(u); lastFallDamage.remove(u);
+        lastMoveDir.remove(u); lastVelocity.remove(u); lastTeleport.remove(u);
+        lastFirework.remove(u); lastBlockPlace.remove(u); lastBlockBreak.remove(u);
+        lastSwing.remove(u); lastAttackTime.remove(u); lastTarget.remove(u);
+        itemUseStart.remove(u); lastInvClick.remove(u); fastClickStreak.remove(u);
+        lastGlideToggle.remove(u); clicks.remove(u); movePackets.remove(u);
     }
 
     @EventHandler
     public void onTeleport(PlayerTeleportEvent e) {
-        lastTeleport.put(e.getPlayer().getUniqueId(), System.currentTimeMillis());
-        airTicks.put(e.getPlayer().getUniqueId(), 0);
-        realFallDist.put(e.getPlayer().getUniqueId(), 0.0);
+        UUID u = e.getPlayer().getUniqueId();
+        lastTeleport.put(u, System.currentTimeMillis());
+        airTicks.put(u, 0);
+        realFallDist.put(u, 0.0);
+        airStates.remove(u);
+    }
+
+    @EventHandler
+    public void onRiptide(PlayerRiptideEvent e) {
+        lastVelocity.put(e.getPlayer().getUniqueId(), System.currentTimeMillis());
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onFallDamage(EntityDamageEvent e) {
+        if (e.getEntity() instanceof Player p && e.getCause() == EntityDamageEvent.DamageCause.FALL && !e.isCancelled()) {
+            lastFallDamage.put(p.getUniqueId(), System.currentTimeMillis());
+        }
     }
 
     @EventHandler
@@ -136,9 +161,8 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onCombat(EntityDamageByEntityEvent event) {
-        if (!(event.getDamager() instanceof Player attacker)) return;
         if (event.getCause() != EntityDamageEvent.DamageCause.ENTITY_ATTACK) return;
-        if (isExemptMode(attacker)) return;
+        if (!(event.getDamager() instanceof Player attacker) || isExemptMode(attacker)) return;
 
         UUID u = attacker.getUniqueId();
         Entity target = event.getEntity();
@@ -147,7 +171,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         checkCPS(attacker);
 
         if (now - lastSwing.getOrDefault(u, 0L) > 550) {
-            flag(attacker, "NoSwing / KillAura", "Ataque sin animacion");
+            flag(attacker, "NoSwing / KillAura", "Sin animacion");
             event.setCancelled(true);
             return;
         }
@@ -174,20 +198,20 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
             return;
         }
 
-        if (attacker.getFallDistance() > 0.5f && trackedFall < 0.05 && airTicks.getOrDefault(u, 0) < 2 && !attacker.isOnGround()) {
+        if (attacker.getFallDistance() > 0.0f && !attacker.isOnGround() && trackedFall < 0.08 && lastDeltaY.getOrDefault(u, 0.0) >= 0.0) {
             flag(attacker, "Criticals", "Packet Crit");
             event.setCancelled(true);
             return;
         }
 
-        int ping = Math.min(Math.max(attacker.getPing(), 0), 300);
-        double lag = ping * 0.002;
-
         Location eyeLoc = attacker.getEyeLocation();
         Vector eye = eyeLoc.toVector();
         Vector dir = eyeLoc.getDirection();
 
-        double expand = (target instanceof EnderCrystal ? 0.35 : 0.22) + lag * 0.5;
+        int ping = Math.min(attacker.getPing(), 300);
+        double pingComp = ping * 0.002;
+
+        double expand = (target instanceof EnderCrystal ? 0.35 : 0.22) + pingComp;
         BoundingBox hitBox = target.getBoundingBox().expand(expand);
         RayTraceResult ray = hitBox.rayTrace(eye, dir, 6.5);
 
@@ -198,7 +222,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         double dist = getMinDistance(eye, target.getBoundingBox().expand(0.1));
-        if (dist > 3.08 + lag) {
+        if (dist > 3.08 + pingComp) {
             flag(attacker, "Reach", String.format("Dist=%.2f", dist));
             event.setCancelled(true);
             return;
@@ -206,7 +230,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
 
         RayTraceResult wallRay = attacker.getWorld().rayTraceBlocks(eyeLoc, dir, dist, FluidCollisionMode.NEVER, true);
         if (wallRay != null && wallRay.getHitBlock() != null && wallRay.getHitBlock().getType().isOccluding()) {
-            flag(attacker, "WallHit", "Golpe a traves de pared");
+            flag(attacker, "WallHit", "Golpe tras pared");
             event.setCancelled(true);
         }
     }
@@ -253,7 +277,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         long now = System.currentTimeMillis();
 
         if (against.isEmpty() || (against.isLiquid() && !placed.getType().name().contains("LILY") && !placed.getType().name().contains("FROG")) || hasNoSolidNeighbors(placed)) {
-            flag(p, "AirPlace", "Sin bloque de apoyo");
+            flag(p, "AirPlace", "Sin apoyo");
             event.setCancelled(true);
             return;
         }
@@ -279,12 +303,9 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         Vector toBlock = placed.getLocation().add(0.5, 0.5, 0.5).toVector().subtract(p.getEyeLocation().toVector());
-        if (toBlock.lengthSquared() > 0.0001) {
-            toBlock.normalize();
-            if (p.getEyeLocation().getDirection().dot(toBlock) < -0.15) {
-                flag(p, "Scaffold (Rotation)", "Angulo imposible");
-                event.setCancelled(true);
-            }
+        if (toBlock.lengthSquared() > 1e-4 && p.getEyeLocation().getDirection().dot(toBlock.normalize()) < -0.15) {
+            flag(p, "Scaffold (Rotation)", "Angulo imposible");
+            event.setCancelled(true);
         }
     }
 
@@ -324,6 +345,8 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         Location to = event.getTo();
         if (to == null || isExemptMode(p)) return;
 
+        UUID u = p.getUniqueId();
+
         if (Double.isNaN(to.getX()) || Double.isNaN(to.getY()) || Double.isNaN(to.getZ()) || Double.isInfinite(to.getY()) || Math.abs(to.getX()) > 29999999 || Math.abs(to.getZ()) > 29999999) {
             flag(p, "Crasher", "Coordenadas invalidas");
             event.setCancelled(true);
@@ -332,11 +355,10 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
 
         if (Math.abs(to.getPitch()) > 90.0f) {
             flag(p, "BadPackets", "Pitch=" + to.getPitch());
-            event.setTo(back(p.getUniqueId(), from));
+            event.setTo(back(u, from));
             return;
         }
 
-        UUID u = p.getUniqueId();
         long now = System.currentTimeMillis();
 
         float yawDiff = Math.abs(to.getYaw() - from.getYaw()) % 360.0f;
@@ -348,13 +370,14 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         if (from.getX() == to.getX() && from.getY() == to.getY() && from.getZ() == to.getZ()) return;
 
         List<Long> packets = movePackets.computeIfAbsent(u, k -> new ArrayList<>());
-        if (now - lastMovePacket.getOrDefault(u, now) > 300) packets.clear();
-        lastMovePacket.put(u, now);
+        if (!packets.isEmpty() && now - packets.get(packets.size() - 1) > 300) {
+            packets.clear();
+        }
         packets.add(now);
         packets.removeIf(t -> now - t > 1000);
         if (packets.size() > 28 && now - lastTeleport.getOrDefault(u, 0L) > 1500) {
             flag(p, "Timer / Blink", "PPS=" + packets.size());
-            event.setTo(back(p.getUniqueId(), from));
+            event.setTo(back(u, from));
             return;
         }
 
@@ -362,12 +385,10 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         double deltaXZ = Math.hypot(to.getX() - from.getX(), to.getZ() - from.getZ());
         boolean recentlyHit = now - lastVelocity.getOrDefault(u, 0L) < 1300;
         boolean recentlyTp = now - lastTeleport.getOrDefault(u, 0L) < 1500;
-        boolean nearBounce = isNearMaterial(from, "SLIME", "BED", "HONEY", "PISTON");
-
-        if (deltaY < 0) realFallDist.put(u, realFallDist.getOrDefault(u, 0.0) - deltaY);
-        else if (p.isOnGround()) realFallDist.put(u, 0.0);
+        boolean nearBounce = isNearMaterial(from, "SLIME", "_BED", "HONEY", "PISTON");
 
         if (p.isInsideVehicle()) {
+            realFallDist.put(u, 0.0);
             Entity v = p.getVehicle();
             if (v != null && !(v instanceof LivingEntity && v.isOnGround()) && !v.isInWater()) {
                 if (deltaXZ > 1.4 || (deltaY > 0.0 && !v.isOnGround())) {
@@ -375,7 +396,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
                     vehicleAirTicks.put(u, vt);
                     if (vt > 7) {
                         flag(p, "BoatFly / EntitySpeed", String.format("XZ=%.2f DY=%.2f", deltaXZ, deltaY));
-                        v.teleport(from);
+                        v.teleport(back(u, from));
                     }
                 } else {
                     vehicleAirTicks.put(u, 0);
@@ -386,17 +407,17 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
 
         if (!recentlyTp && (Math.abs(deltaY) > 1.5 || deltaXZ > 1.2) && to.getBlock().getType().isOccluding() && to.clone().add(0, 1, 0).getBlock().getType().isOccluding()) {
             flag(p, "Phase / VClip", "Atravesar bloques");
-            event.setTo(back(p.getUniqueId(), from));
+            event.setTo(back(u, from));
             return;
         }
 
         if (p.isSprinting()) {
             Vector moveVec = new Vector(to.getX() - from.getX(), 0, to.getZ() - from.getZ());
             Vector lookVec = new Vector(to.getDirection().getX(), 0, to.getDirection().getZ());
-            if (deltaXZ > 0.22 && moveVec.lengthSquared() > 1.0E-6 && lookVec.lengthSquared() > 1.0E-6
+            if (deltaXZ > 0.22 && moveVec.lengthSquared() > 1e-4 && lookVec.lengthSquared() > 1e-4
                     && moveVec.normalize().dot(lookVec.normalize()) < -0.25 && !recentlyHit) {
                 flag(p, "OmniSprint", "Correr hacia atras");
-                event.setTo(back(p.getUniqueId(), from));
+                event.setTo(back(u, from));
             }
             if (p.getFoodLevel() <= 6 || p.hasPotionEffect(PotionEffectType.BLINDNESS)) {
                 flag(p, "BadPackets (Sprint)", "Sprint ilegal");
@@ -405,22 +426,23 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         if (p.isGliding()) {
+            realFallDist.put(u, 0.0);
             boolean usedFirework = now - lastFirework.getOrDefault(u, 0L) < 3500;
             if (!usedFirework && !recentlyHit) {
                 if (deltaXZ > 1.65) {
                     flag(p, "ElytraBoost", String.format("XZ=%.2f", deltaXZ));
-                    event.setTo(back(p.getUniqueId(), from));
+                    event.setTo(back(u, from));
                 } else if (deltaY > 0.05 && to.getPitch() > -15) {
                     flag(p, "ElytraFly", String.format("DY=%.2f", deltaY));
-                    event.setTo(back(p.getUniqueId(), from));
+                    event.setTo(back(u, from));
                 }
             }
             return;
         }
 
         if (isInSlowBlock(to) && deltaXZ > 0.16 && !recentlyHit) {
-            flag(p, "NoWeb / NoSlow", "Rapido en telarana/arbusto");
-            event.setTo(back(p.getUniqueId(), from));
+            flag(p, "NoWeb / NoSlow", "Rapido en bloque lento");
+            event.setTo(back(u, from));
             return;
         }
 
@@ -430,7 +452,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
                 noSlowTicks.put(u, ns);
                 if (ns > 5) {
                     flag(p, "NoSlow", String.format("XZ=%.2f", deltaXZ));
-                    event.setTo(back(p.getUniqueId(), from));
+                    event.setTo(back(u, from));
                 }
             } else {
                 noSlowTicks.put(u, 0);
@@ -445,7 +467,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
                 waterTicks.put(u, wt);
                 if (wt > 5) {
                     flag(p, "Jesus", "Caminar en liquido");
-                    event.setTo(back(p.getUniqueId(), from));
+                    event.setTo(back(u, from));
                 }
             }
         } else {
@@ -453,89 +475,171 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         if (p.isInWater() || p.isSwimming()) {
+            realFallDist.put(u, 0.0);
+            airStates.remove(u);
             double maxWater = 0.38;
             if (p.hasPotionEffect(PotionEffectType.DOLPHINS_GRACE)) maxWater += 0.35;
             if (deltaXZ > maxWater && !recentlyHit) {
                 flag(p, "WaterSpeed", String.format("XZ=%.2f", deltaXZ));
-                event.setTo(back(p.getUniqueId(), from));
+                event.setTo(back(u, from));
             }
             airTicks.put(u, 0);
             return;
         }
 
         if (p.isClimbing() || p.isInLava() || p.hasPotionEffect(PotionEffectType.LEVITATION) || p.hasPotionEffect(PotionEffectType.SLOW_FALLING)) {
+            realFallDist.put(u, 0.0);
             airTicks.put(u, 0);
+            airStates.remove(u);
             return;
         }
 
-        double maxJump = 0.60;
-        if (p.hasPotionEffect(PotionEffectType.JUMP_BOOST)) {
-            maxJump += (p.getPotionEffect(PotionEffectType.JUMP_BOOST).getAmplifier() + 1) * 0.15;
+        boolean inAir = isTrulyInAir(to);
+        int jumpBoost = getPotionLevel(p, PotionEffectType.JUMP_BOOST);
+
+        // --- FLY (AirState: Altura y Gravedad) ---
+        AirState st = airStates.computeIfAbsent(u, k -> new AirState());
+        if (isBoosted(p, u, now)) {
+            st.last = 0;
+        } else if (!inAir) {
+            st.groundY = to.getY();
+            st.peakY = to.getY();
+            st.peakTime = now;
+            st.last = now;
+            st.vio = 0;
+        } else {
+            if (st.last == 0) {
+                st.groundY = from.getY();
+                st.peakY = Math.max(from.getY(), to.getY());
+                st.peakTime = now;
+                st.last = now;
+                st.vio = 0;
+            } else {
+                long gap = now - st.last;
+                if (gap > 250) {
+                    st.groundY = from.getY();
+                    st.peakY = to.getY();
+                    st.peakTime = now;
+                    st.vio = 0;
+                } else if (gap >= 120) {
+                    st.peakTime += gap - 50;
+                }
+                st.last = now;
+
+                if (to.getY() > st.peakY) {
+                    st.peakY = to.getY();
+                    st.peakTime = now;
+                }
+
+                double maxGain = 1.32 + jumpBoost * 0.75;
+                if (to.getY() - st.groundY > maxGain) {
+                    flag(p, "Fly (Altura)", String.format("Gain=%.2f", to.getY() - st.groundY));
+                    event.setTo(back(u, from));
+                    return;
+                }
+
+                double n = (now - st.peakTime) / 50.0;
+                if (n >= 8.0) {
+                    double expected = 3.92 * (n - 49.0 * (1.0 - Math.pow(0.98, n)));
+                    double drop = st.peakY - to.getY();
+                    if (drop < 0.35 * expected) {
+                        st.vio++;
+                        if (st.vio >= 3) {
+                            flag(p, "Fly (Hover/Slow)", String.format("Drop=%.2f Exp=%.2f", drop, expected));
+                            event.setTo(back(u, from));
+                            st.vio = 0;
+                            return;
+                        }
+                    } else {
+                        st.vio = Math.max(0, st.vio - 1);
+                    }
+                }
+            }
         }
+
+        double maxJump = 0.60 + jumpBoost * 0.15;
         if (deltaY > maxJump && !recentlyHit && !nearBounce && !recentlyTp) {
             flag(p, "Step / HighJump", String.format("DY=%.2f", deltaY));
-            event.setTo(back(p.getUniqueId(), from));
+            event.setTo(back(u, from));
             return;
         }
 
         if (from.getY() % 0.015625 == 0.0 && deltaY < -0.95 && !recentlyTp && !recentlyHit) {
             flag(p, "ReverseStep / FastFall", String.format("DY=%.2f", deltaY));
-            event.setTo(back(p.getUniqueId(), from));
+            event.setTo(back(u, from));
             return;
         }
 
         double maxSpeed = isNearMaterial(from, "ICE", "PACKED_ICE", "BLUE_ICE") ? 1.15 : 0.67;
-        if (p.hasPotionEffect(PotionEffectType.SPEED)) {
-            maxSpeed += (p.getPotionEffect(PotionEffectType.SPEED).getAmplifier() + 1) * 0.16;
-        }
+        maxSpeed += getPotionLevel(p, PotionEffectType.SPEED) * 0.16;
         if (deltaXZ > maxSpeed && !recentlyHit && !recentlyTp) {
             flag(p, "Speed", String.format("Vel=%.2f", deltaXZ));
-            event.setTo(back(p.getUniqueId(), from));
+            event.setTo(back(u, from));
+            return;
         }
 
-        boolean inAir = isTrulyInAir(to);
         if (inAir) {
             int ticks = airTicks.getOrDefault(u, 0) + 1;
             airTicks.put(u, ticks);
-            double prevDY = lastDeltaY.getOrDefault(u, 0.0);
             double prevXZ = lastDeltaXZ.getOrDefault(u, 0.0);
 
+            if (deltaY < 0) {
+                realFallDist.put(u, realFallDist.getOrDefault(u, 0.0) - deltaY);
+            }
+
             if (p.isOnGround() && ticks > 4 && Math.abs(deltaY) > 0.01) {
-                flag(p, "NoFall (GroundSpoof)", "OnGround en el aire");
+                flag(p, "NoFall (GroundSpoof)", "OnGround en aire");
             }
 
             Vector curDir = new Vector(to.getX() - from.getX(), 0, to.getZ() - from.getZ());
             Vector prevDir = lastMoveDir.get(u);
-            if (ticks > 3 && deltaXZ > 0.26 && prevDir != null && curDir.lengthSquared() > 0 && prevDir.lengthSquared() > 0) {
+            if (ticks > 3 && deltaXZ > 0.26 && prevDir != null && curDir.lengthSquared() > 1e-4 && prevDir.lengthSquared() > 1e-4) {
                 if (curDir.clone().normalize().dot(prevDir.clone().normalize()) < 0.15 && deltaXZ >= prevXZ * 0.95 && !recentlyHit) {
-                    flag(p, "Strafe", "Cambio de direccion en aire");
-                    event.setTo(back(p.getUniqueId(), from));
+                    flag(p, "Strafe", "Cambio brusco en aire");
+                    event.setTo(back(u, from));
                 }
             }
             lastMoveDir.put(u, curDir);
 
             if (ticks > 3 && deltaY > 0.1 && isTouchingWall(to) && !recentlyHit && !nearBounce) {
                 flag(p, "Spider", "Trepar pared");
-                event.setTo(back(p.getUniqueId(), from));
+                event.setTo(back(u, from));
             }
 
-            if (ticks > 6 && !recentlyHit && !nearBounce && !recentlyTp) {
-                if (deltaY >= 0.0) {
-                    flag(p, "Fly (Hover/Ascend)", String.format("DY=%.3f", deltaY));
-                    event.setTo(back(u, from));
-                } else if (deltaY > prevDY - 0.01 && deltaY > -0.1) {
-                    flag(p, "Fly (Glide)", String.format("DY=%.3f", deltaY));
-                    event.setTo(back(u, from));
-                }
-            }
             lastDeltaY.put(u, deltaY);
             lastDeltaXZ.put(u, deltaXZ);
         } else {
-            lastGround.put(u, event.getTo().clone());
+            double rf = realFallDist.getOrDefault(u, 0.0);
+            if (rf > 4.0 + jumpBoost) {
+                checkLanding(p, to, rf, jumpBoost);
+            }
+            realFallDist.put(u, 0.0);
             airTicks.put(u, 0);
             lastDeltaY.put(u, 0.0);
             lastDeltaXZ.put(u, deltaXZ);
+            lastGround.put(u, to.clone());
         }
+    }
+
+    private void checkLanding(Player p, Location landLoc, double rf, int jumpBoost) {
+        if (p.isInvulnerable() || p.getNoDamageTicks() > 0
+                || p.hasPotionEffect(PotionEffectType.RESISTANCE)
+                || p.hasPotionEffect(PotionEffectType.SLOW_FALLING)
+                || p.hasPotionEffect(PotionEffectType.LEVITATION)
+                || !p.getWorld().getGameRuleValue(GameRules.FALL_DAMAGE)
+                || isCushioned(landLoc)) {
+            return;
+        }
+        UUID u = p.getUniqueId();
+        long landTime = System.currentTimeMillis();
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (!p.isOnline() || p.isDead() || isExemptMode(p)) return;
+            if (lastFallDamage.getOrDefault(u, 0L) < landTime - 100) {
+                flag(p, "NoFall", String.format("Fall=%.1f", rf));
+                double dmg = Math.ceil(rf - 3.0 - jumpBoost);
+                if (dmg > 0) p.damage(dmg);
+            }
+        }, 10L);
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
@@ -548,7 +652,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
             if (b.getType().name().contains("CHEST") || b.getType().name().contains("SHULKER") || b.getType().name().contains("BARREL") || b.getType() == Material.ENDER_CHEST) {
                 RayTraceResult ray = p.getWorld().rayTraceBlocks(p.getEyeLocation(), p.getEyeLocation().getDirection(), 5.5, FluidCollisionMode.NEVER, true);
                 if (ray != null && ray.getHitBlock() != null && !ray.getHitBlock().equals(b) && ray.getHitBlock().getType().isOccluding()) {
-                    flag(p, "GhostHand", "Abrir cofre tras pared");
+                    flag(p, "GhostHand", "Interactuar tras pared");
                     event.setCancelled(true);
                     return;
                 }
@@ -561,7 +665,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
                 Material m = item.getType();
                 if (m == Material.FIREWORK_ROCKET) {
                     lastFirework.put(p.getUniqueId(), System.currentTimeMillis());
-                } else if (m.isEdible() || m == Material.POTION || m == Material.BOW) {
+                } else if (m.isEdible() || m == Material.POTION || m == Material.BOW || m == Material.TRIDENT) {
                     itemUseStart.put(p.getUniqueId(), System.currentTimeMillis());
                 }
             }
@@ -589,10 +693,8 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         UUID u = p.getUniqueId();
         long now = System.currentTimeMillis();
 
-        InventoryView view = event.getView();
-        boolean vanillaInv = view.getTopInventory().getType() == InventoryType.CRAFTING || view.getTopInventory().getType() == InventoryType.CHEST && view.getTopInventory().getHolder() != null;
-        if (vanillaInv && p.isSprinting() && lastDeltaXZ.getOrDefault(u, 0.0) > 0.22) {
-            flag(p, "InventoryMove", "Click en movimiento");
+        if (p.isSprinting() && lastDeltaXZ.getOrDefault(u, 0.0) > 0.22 && event.getView().getTopInventory().getHolder() != null) {
+            flag(p, "InventoryMove", "Click corriendo");
             event.setCancelled(true);
             return;
         }
@@ -643,33 +745,61 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
 
     private void flag(Player cheater, String check, String info) {
         UUID u = cheater.getUniqueId();
-        long now = System.currentTimeMillis();
-        int vl = vlMap.getOrDefault(u, 0);
-        Long last = vlTime.get(u);
-        if (last != null) vl = Math.max(0, vl - (int) ((now - last) / 15000L));
-        vl++;
+        int vl = vlMap.getOrDefault(u, 0) + 1;
         vlMap.put(u, vl);
-        vlTime.put(u, now);
+        lastFlagTime.put(u, System.currentTimeMillis());
 
-        String alert = String.format("§8[§c§lVectra§8] §f%s §7falló §c%s §8[§7%s§8] §c(x%d)",
+        String raw = String.format("§8[§c§lVectra§8] §f%s §7falló §c%s §8[§7%s§8] §c(x%d)",
                 cheater.getName(), check, info, vl);
-
-        getLogger().warning(ChatColor.stripColor(alert));
+        Component comp = LegacyComponentSerializer.legacySection().deserialize(raw);
+        getLogger().info(PlainTextComponentSerializer.plainText().serialize(comp));
 
         for (Player staff : Bukkit.getOnlinePlayers()) {
             if (staff.isOp() || staff.hasPermission("vectra.alerts") || staffAlerts.contains(staff.getUniqueId())) {
-                staff.sendMessage(alert);
+                staff.sendMessage(comp);
             }
         }
 
         if (vl >= 15) {
             vlMap.put(u, 0);
-            cheater.kickPlayer("§c§lVectra AntiCheat\n\n§7Modificación ilegal detectada: §f" + check);
+            Component kickMsg = LegacyComponentSerializer.legacySection().deserialize(
+                    "§c§lVectra AntiCheat\n\n§7Modificación ilegal detectada: §f" + check);
+            cheater.kick(kickMsg);
         }
     }
 
+    private Location back(UUID u, Location fallback) {
+        Location g = lastGround.get(u);
+        if (g != null && g.getWorld() != null && g.getWorld().equals(fallback.getWorld()) && g.distanceSquared(fallback) < 100.0) {
+            Location dest = g.clone();
+            dest.setYaw(fallback.getYaw());
+            dest.setPitch(fallback.getPitch());
+            return dest;
+        }
+        return fallback;
+    }
+
+    private boolean isBoosted(Player p, UUID u, long now) {
+        return now - lastVelocity.getOrDefault(u, 0L) < 3000
+                || now - lastTeleport.getOrDefault(u, 0L) < 1500
+                || now - lastGlideToggle.getOrDefault(u, 0L) < 1500
+                || isCushioned(p.getLocation());
+    }
+
+    private boolean isCushioned(Location loc) {
+        return isNearMaterial(loc, "WATER", "LAVA", "SLIME", "HAY_BLOCK", "_BED", "HONEY",
+                "COBWEB", "POWDER_SNOW", "SCAFFOLDING", "VINE", "LADDER", "SWEET_BERRY",
+                "BUBBLE_COLUMN", "TWISTING_VINES", "WEEPING_VINES", "PISTON");
+    }
+
+    private int getPotionLevel(Player p, PotionEffectType type) {
+        PotionEffect ef = p.getPotionEffect(type);
+        return ef != null ? ef.getAmplifier() + 1 : 0;
+    }
+
     private boolean isExemptMode(Player p) {
-        return p.getGameMode() == GameMode.CREATIVE || p.getGameMode() == GameMode.SPECTATOR || p.getAllowFlight() || p.isFlying() || p.hasPermission("vectra.bypass");
+        return p.getGameMode() == GameMode.CREATIVE || p.getGameMode() == GameMode.SPECTATOR
+                || p.getAllowFlight() || p.isFlying() || p.hasPermission("vectra.bypass");
     }
 
     private boolean isInSlowBlock(Location loc) {
@@ -745,14 +875,15 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         if (args.length == 2 && args[0].equalsIgnoreCase("alerts")) {
             Player t = Bukkit.getPlayer(args[1]);
             if (t == null) return true;
-            if (toggleAlerts(t.getUniqueId())) {
-                sender.sendMessage("§aAlertas activadas para " + t.getName());
+            if (staffAlerts.remove(t.getUniqueId())) {
+                sender.sendMessage(LegacyComponentSerializer.legacySection().deserialize("§cAlertas desactivadas para " + t.getName()));
             } else {
-                sender.sendMessage("§cAlertas desactivadas para " + t.getName());
+                staffAlerts.add(t.getUniqueId());
+                sender.sendMessage(LegacyComponentSerializer.legacySection().deserialize("§aAlertas activadas para " + t.getName()));
             }
             return true;
         }
-        sender.sendMessage("§cUsa: /vectra alerts <jugador>");
+        sender.sendMessage(LegacyComponentSerializer.legacySection().deserialize("§cUsa: /vectra alerts <jugador>"));
         return true;
     }
 }
