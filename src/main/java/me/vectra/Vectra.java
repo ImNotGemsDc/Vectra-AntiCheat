@@ -32,6 +32,9 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
     private final Map<UUID, Integer> vehicleAirTicks = new HashMap<>();
     private final Map<UUID, Integer> waterTicks = new HashMap<>();
     private final Map<UUID, Integer> noSlowTicks = new HashMap<>();
+    private final Map<UUID, Integer> hoverTicks = new HashMap<>();
+    private final Map<UUID, Location> hoverPos = new HashMap<>();
+    private final Map<UUID, Location> lastGround = new HashMap<>();
     private final Map<UUID, Double> lastDeltaY = new HashMap<>();
     private final Map<UUID, Double> lastDeltaXZ = new HashMap<>();
     private final Map<UUID, Double> realFallDist = new HashMap<>();
@@ -57,6 +60,41 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         instance = this;
         getServer().getPluginManager().registerEvents(this, this);
         if (getCommand("vectra") != null) getCommand("vectra").setExecutor(this);
+        Bukkit.getScheduler().runTaskTimer(this, this::hoverCheck, 20L, 5L);
+        getLogger().info("Vectra activado");
+    }
+
+    private Location back(UUID u, Location def) {
+        Location g = lastGround.get(u);
+        return g != null && g.getWorld() == def.getWorld() ? g : def;
+    }
+
+    private void hoverCheck() {
+        long now = System.currentTimeMillis();
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            UUID u = p.getUniqueId();
+            if (isExemptMode(p) || p.isDead() || p.isGliding() || p.isInWater() || p.isSwimming() || p.isInLava()
+                    || p.isInsideVehicle() || p.isClimbing() || p.hasPotionEffect(PotionEffectType.LEVITATION)
+                    || p.hasPotionEffect(PotionEffectType.SLOW_FALLING)) {
+                hoverTicks.put(u, 0);
+                hoverPos.remove(u);
+                continue;
+            }
+            Location l = p.getLocation();
+            Location prev = hoverPos.put(u, l);
+            boolean safe = now - lastVelocity.getOrDefault(u, 0L) > 1300 && now - lastTeleport.getOrDefault(u, 0L) > 1500;
+            if (prev != null && safe && prev.getWorld() == l.getWorld() && Math.abs(prev.getY() - l.getY()) < 0.0001 && isTrulyInAir(l) && !isNearMaterial(l, "SLIME", "HONEY", "COBWEB", "SCAFFOLDING")) {
+                int h = hoverTicks.getOrDefault(u, 0) + 1;
+                hoverTicks.put(u, h);
+                if (h >= 6) {
+                    flag(p, "Fly (Hover)", "Flotando " + h * 5 + " ticks");
+                    p.teleport(back(u, l));
+                    hoverTicks.put(u, 0);
+                }
+            } else {
+                hoverTicks.put(u, 0);
+            }
+        }
     }
 
     public static Vectra getInstance() { return instance; }
@@ -71,6 +109,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
     public void onQuit(PlayerQuitEvent e) {
         UUID u = e.getPlayer().getUniqueId();
         staffAlerts.remove(u);
+        hoverTicks.remove(u); hoverPos.remove(u); lastGround.remove(u);
         vlMap.remove(u); vlTime.remove(u); airTicks.remove(u); vehicleAirTicks.remove(u);
         waterTicks.remove(u); noSlowTicks.remove(u); lastDeltaY.remove(u);
         lastDeltaXZ.remove(u); realFallDist.remove(u); lastMoveDir.remove(u);
@@ -293,7 +332,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
 
         if (Math.abs(to.getPitch()) > 90.0f) {
             flag(p, "BadPackets", "Pitch=" + to.getPitch());
-            event.setTo(from);
+            event.setTo(back(p.getUniqueId(), from));
             return;
         }
 
@@ -315,7 +354,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         packets.removeIf(t -> now - t > 1000);
         if (packets.size() > 28 && now - lastTeleport.getOrDefault(u, 0L) > 1500) {
             flag(p, "Timer / Blink", "PPS=" + packets.size());
-            event.setTo(from);
+            event.setTo(back(p.getUniqueId(), from));
             return;
         }
 
@@ -347,7 +386,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
 
         if (!recentlyTp && (Math.abs(deltaY) > 1.5 || deltaXZ > 1.2) && to.getBlock().getType().isOccluding() && to.clone().add(0, 1, 0).getBlock().getType().isOccluding()) {
             flag(p, "Phase / VClip", "Atravesar bloques");
-            event.setTo(from);
+            event.setTo(back(p.getUniqueId(), from));
             return;
         }
 
@@ -357,7 +396,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
             if (deltaXZ > 0.22 && moveVec.lengthSquared() > 1.0E-6 && lookVec.lengthSquared() > 1.0E-6
                     && moveVec.normalize().dot(lookVec.normalize()) < -0.25 && !recentlyHit) {
                 flag(p, "OmniSprint", "Correr hacia atras");
-                event.setTo(from);
+                event.setTo(back(p.getUniqueId(), from));
             }
             if (p.getFoodLevel() <= 6 || p.hasPotionEffect(PotionEffectType.BLINDNESS)) {
                 flag(p, "BadPackets (Sprint)", "Sprint ilegal");
@@ -370,10 +409,10 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
             if (!usedFirework && !recentlyHit) {
                 if (deltaXZ > 1.65) {
                     flag(p, "ElytraBoost", String.format("XZ=%.2f", deltaXZ));
-                    event.setTo(from);
+                    event.setTo(back(p.getUniqueId(), from));
                 } else if (deltaY > 0.05 && to.getPitch() > -15) {
                     flag(p, "ElytraFly", String.format("DY=%.2f", deltaY));
-                    event.setTo(from);
+                    event.setTo(back(p.getUniqueId(), from));
                 }
             }
             return;
@@ -381,7 +420,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
 
         if (isInSlowBlock(to) && deltaXZ > 0.16 && !recentlyHit) {
             flag(p, "NoWeb / NoSlow", "Rapido en telarana/arbusto");
-            event.setTo(from);
+            event.setTo(back(p.getUniqueId(), from));
             return;
         }
 
@@ -391,7 +430,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
                 noSlowTicks.put(u, ns);
                 if (ns > 5) {
                     flag(p, "NoSlow", String.format("XZ=%.2f", deltaXZ));
-                    event.setTo(from);
+                    event.setTo(back(p.getUniqueId(), from));
                 }
             } else {
                 noSlowTicks.put(u, 0);
@@ -406,7 +445,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
                 waterTicks.put(u, wt);
                 if (wt > 5) {
                     flag(p, "Jesus", "Caminar en liquido");
-                    event.setTo(from);
+                    event.setTo(back(p.getUniqueId(), from));
                 }
             }
         } else {
@@ -418,7 +457,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
             if (p.hasPotionEffect(PotionEffectType.DOLPHINS_GRACE)) maxWater += 0.35;
             if (deltaXZ > maxWater && !recentlyHit) {
                 flag(p, "WaterSpeed", String.format("XZ=%.2f", deltaXZ));
-                event.setTo(from);
+                event.setTo(back(p.getUniqueId(), from));
             }
             airTicks.put(u, 0);
             return;
@@ -435,13 +474,13 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         }
         if (deltaY > maxJump && !recentlyHit && !nearBounce && !recentlyTp) {
             flag(p, "Step / HighJump", String.format("DY=%.2f", deltaY));
-            event.setTo(from);
+            event.setTo(back(p.getUniqueId(), from));
             return;
         }
 
         if (from.getY() % 0.015625 == 0.0 && deltaY < -0.95 && !recentlyTp && !recentlyHit) {
             flag(p, "ReverseStep / FastFall", String.format("DY=%.2f", deltaY));
-            event.setTo(from);
+            event.setTo(back(p.getUniqueId(), from));
             return;
         }
 
@@ -451,7 +490,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         }
         if (deltaXZ > maxSpeed && !recentlyHit && !recentlyTp) {
             flag(p, "Speed", String.format("Vel=%.2f", deltaXZ));
-            event.setTo(from);
+            event.setTo(back(p.getUniqueId(), from));
         }
 
         boolean inAir = isTrulyInAir(to);
@@ -470,28 +509,29 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
             if (ticks > 3 && deltaXZ > 0.26 && prevDir != null && curDir.lengthSquared() > 0 && prevDir.lengthSquared() > 0) {
                 if (curDir.clone().normalize().dot(prevDir.clone().normalize()) < 0.15 && deltaXZ >= prevXZ * 0.95 && !recentlyHit) {
                     flag(p, "Strafe", "Cambio de direccion en aire");
-                    event.setTo(from);
+                    event.setTo(back(p.getUniqueId(), from));
                 }
             }
             lastMoveDir.put(u, curDir);
 
             if (ticks > 3 && deltaY > 0.1 && isTouchingWall(to) && !recentlyHit && !nearBounce) {
                 flag(p, "Spider", "Trepar pared");
-                event.setTo(from);
+                event.setTo(back(p.getUniqueId(), from));
             }
 
-            if (ticks > 9 && !recentlyHit && !nearBounce && !recentlyTp) {
+            if (ticks > 6 && !recentlyHit && !nearBounce && !recentlyTp) {
                 if (deltaY >= 0.0) {
                     flag(p, "Fly (Hover/Ascend)", String.format("DY=%.3f", deltaY));
-                    event.setTo(from);
+                    event.setTo(back(u, from));
                 } else if (deltaY > prevDY - 0.01 && deltaY > -0.1) {
                     flag(p, "Fly (Glide)", String.format("DY=%.3f", deltaY));
-                    event.setTo(from);
+                    event.setTo(back(u, from));
                 }
             }
             lastDeltaY.put(u, deltaY);
             lastDeltaXZ.put(u, deltaXZ);
         } else {
+            lastGround.put(u, event.getTo().clone());
             airTicks.put(u, 0);
             lastDeltaY.put(u, 0.0);
             lastDeltaXZ.put(u, deltaXZ);
@@ -614,8 +654,10 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
         String alert = String.format("§8[§c§lVectra§8] §f%s §7falló §c%s §8[§7%s§8] §c(x%d)",
                 cheater.getName(), check, info, vl);
 
+        getLogger().warning(ChatColor.stripColor(alert));
+
         for (Player staff : Bukkit.getOnlinePlayers()) {
-            if (staff.isOp() || staffAlerts.contains(staff.getUniqueId())) {
+            if (staff.isOp() || staff.hasPermission("vectra.alerts") || staffAlerts.contains(staff.getUniqueId())) {
                 staff.sendMessage(alert);
             }
         }
@@ -627,7 +669,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
     }
 
     private boolean isExemptMode(Player p) {
-        return p.getGameMode() == GameMode.CREATIVE || p.getGameMode() == GameMode.SPECTATOR || p.getAllowFlight() || p.isFlying();
+        return p.getGameMode() == GameMode.CREATIVE || p.getGameMode() == GameMode.SPECTATOR || p.getAllowFlight() || p.isFlying() || p.hasPermission("vectra.bypass");
     }
 
     private boolean isInSlowBlock(Location loc) {
@@ -699,7 +741,7 @@ public class Vectra extends JavaPlugin implements Listener, CommandExecutor {
 
     @Override
     public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
-        if (!sender.isOp()) return true;
+        if (!sender.isOp() && !sender.hasPermission("vectra.alerts")) return true;
         if (args.length == 2 && args[0].equalsIgnoreCase("alerts")) {
             Player t = Bukkit.getPlayer(args[1]);
             if (t == null) return true;
