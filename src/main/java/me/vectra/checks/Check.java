@@ -35,7 +35,7 @@ public abstract class Check {
                 player.getName(), version, name, type, debugInfo, vl);
 
         Bukkit.getOnlinePlayers().stream()
-                .filter(p -> p.hasPermission("vectra.alerts") || p.isOp())
+                .filter(p -> Vectra.getInstance().hasAlerts(p.getUniqueId()))
                 .forEach(p -> p.sendMessage(alert));
 
         if (vl >= maxVl) {
