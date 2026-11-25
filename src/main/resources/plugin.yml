@@ -1,8 +1,13 @@
 name: Vectra
-version: '1.0'
+version: '1.0.1'
 main: me.vectra.Vectra
 api-version: '1.20'
-depend: [packetevents]
 commands:
   vectra:
     description: Comando principal de Vectra
+    usage: /vectra alerts <jugador>
+permissions:
+  vectra.alerts:
+    default: op
+  vectra.bypass:
+    default: false
